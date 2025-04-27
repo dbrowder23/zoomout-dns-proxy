@@ -1,119 +1,65 @@
-use trust_dns_proto::op::{Message, MessageType, OpCode, Query};
-use trust_dns_proto::rr::{RecordType, RecordClass, Name, RData, Record};
-use trust_dns_proto::rr::rdata::A;
-use trust_dns_proto::serialize::binary::*;
-use tokio::net::UdpSocket;
 use std::net::SocketAddr;
-use regex::Regex;
-use crate::config;
+use std::sync::Arc;
+use tokio::net::UdpSocket;
+use trust_dns_proto::op::{Message, MessageType, OpCode};
+use trust_dns_proto::rr::{Name, RData, Record, RecordType};
+use trust_dns_proto::serialize::binary::{BinDecodable, BinEncodable};
+
+use crate::config::{append_to_blacklist, load_blacklist};
 
 pub struct DnsProxy {
-    listen_addr: String,
-    upstream_addr: String,
+    socket: Arc<UdpSocket>,
     blacklist: Vec<String>,
 }
 
 impl DnsProxy {
-    pub fn new(listen_addr: &str, upstream_addr: String, blacklist: Vec<String>) -> Self {
-        Self {
-            listen_addr: listen_addr.to_string(),
-            upstream_addr,
-            blacklist,
-        }
+    pub async fn new(bind_addr: &str, blacklist_path: &str) -> std::io::Result<Self> {
+        let socket = Arc::new(UdpSocket::bind(bind_addr).await?);
+        let blacklist = load_blacklist(blacklist_path)?;
+        Ok(DnsProxy { socket, blacklist })
     }
 
-    pub async fn run(&self) -> anyhow::Result<()> {
-        let socket = UdpSocket::bind(&self.listen_addr).await?;
-        println!("Listening for DNS requests on {}", &self.listen_addr);
-
+    pub async fn run(&self) -> std::io::Result<()> {
         let mut buf = [0u8; 512];
 
         loop {
-            let (len, addr) = socket.recv_from(&mut buf).await?;
-            let request = buf[..len].to_vec();
-            let blacklist = self.blacklist.clone();
-            let upstream = self.upstream_addr.clone();
-            let socket = socket.try_clone()?;
+            let (len, addr) = self.socket.recv_from(&mut buf).await?;
+            let data = &buf[..len];
 
-            tokio::spawn(async move {
-                if let Err(e) = Self::handle_request(socket, addr, request, blacklist, upstream).await {
-                    eprintln!("Error handling DNS request: {:?}", e);
+            if let Ok(request) = Message::from_bytes(data) {
+                if let Some(query) = request.queries().first() {
+                    let domain = query.name().to_utf8();
+
+                    if self.blacklist.contains(&domain) {
+                        let mut response = Message::new();
+                        response.set_id(request.id());
+                        response.set_message_type(MessageType::Response);
+                        response.set_op_code(OpCode::Query);
+                        response.set_authoritative(true);
+                        response.add_query(query.clone());
+
+                        let record = Record::from_rdata(
+                            query.name().clone(),
+                            300,
+                            RData::A("127.0.0.1".parse().unwrap()),
+                        );
+                        response.add_answer(record);
+
+                        let response_bytes = response.to_bytes()?;
+                        self.socket.send_to(&response_bytes, &addr).await?;
+                        continue;
+                    }
                 }
-            });
-        }
-    }
+            }
 
-    async fn handle_request(
-        socket: UdpSocket,
-        addr: SocketAddr,
-        request: Vec<u8>,
-        blacklist: Vec<String>,
-        upstream: String,
-    ) -> anyhow::Result<()> {
-        let mut decoder = BinDecoder::new(&request);
-        let message = Message::read(&mut decoder)?;
-
-        let queries = message.queries();
-        if queries.is_empty() {
-            return Ok(());
-        }
-
-        let query_name = queries[0].name().to_utf8().to_lowercase();
-
-        let is_blacklisted = blacklist.iter().any(|pattern| query_name.contains(pattern));
-
-        let suspicious_but_new = query_name.ends_with(".zoom.us")
-            && (query_name.contains("api") || query_name.contains("track"));
-
-        let mut response = Message::new();
-        response.set_id(message.id());
-        response.set_message_type(MessageType::Response);
-        response.set_op_code(OpCode::Query);
-        response.set_authoritative(true);
-
-        if is_blacklisted {
-            println!("Blocked blacklisted domain: {}", query_name);
-
-            let record = Record::from_rdata(
-                queries[0].name().clone(),
-                60,
-                RData::A(A::new(127, 0, 0, 1)),
-            );
-
-            response.add_query(queries[0].clone());
-            response.add_answer(record);
-        } else if suspicious_but_new {
-            println!("Suspicious new domain detected and added: {}", query_name);
-            let _ = config::add_to_blacklist(&query_name);
-
-            let record = Record::from_rdata(
-                queries[0].name().clone(),
-                60,
-                RData::A(A::new(127, 0, 0, 1)),
-            );
-
-            response.add_query(queries[0].clone());
-            response.add_answer(record);
-        } else {
-            // Forward to upstream
-            println!("Allowed domain: {}", query_name);
-
-            let forward_socket = UdpSocket::bind("0.0.0.0:0").await?;
-            forward_socket.send_to(&request, &upstream).await?;
+            // Forward the request to an upstream DNS server (e.g., 8.8.8.8)
+            let upstream_addr: SocketAddr = "8.8.8.8:53".parse().unwrap();
+            let upstream_socket = UdpSocket::bind("0.0.0.0:0").await?;
+            upstream_socket.send_to(data, &upstream_addr).await?;
 
             let mut upstream_buf = [0u8; 512];
-            let (len, _) = forward_socket.recv_from(&mut upstream_buf).await?;
-
-            socket.send_to(&upstream_buf[..len], addr).await?;
-            return Ok(());
+            let (up_len, _) = upstream_socket.recv_from(&mut upstream_buf).await?;
+            self.socket.send_to(&upstream_buf[..up_len], &addr).await?;
         }
-
-        let mut response_bytes = Vec::with_capacity(512);
-        let mut encoder = BinEncoder::new(&mut response_bytes);
-        response.emit(&mut encoder)?;
-
-        socket.send_to(&response_bytes, addr).await?;
-
-        Ok(())
     }
 }

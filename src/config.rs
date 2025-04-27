@@ -1,47 +1,29 @@
-use base64::{decode, encode};
-use std::fs::{OpenOptions, read_to_string};
-use std::io::{self, Write};
+use std::fs::{self, OpenOptions};
+use std::io::{self, BufRead, BufReader, Write};
 use std::path::Path;
+use base64::{engine::general_purpose, Engine as _};
 
-/// Path to the blacklist file
-const BLACKLIST_FILE: &str = "blacklist.txt";
+pub fn load_blacklist<P: AsRef<Path>>(path: P) -> io::Result<Vec<String>> {
+    let file = fs::File::open(path)?;
+    let reader = BufReader::new(file);
+    let mut domains = Vec::new();
 
-/// Load and decode blacklist entries from the file
-pub fn load_blacklist() -> Vec<String> {
-    if !Path::new(BLACKLIST_FILE).exists() {
-        println!("Blacklist file not found, creating a new one...");
-        if let Err(e) = std::fs::File::create(BLACKLIST_FILE) {
-            eprintln!("Failed to create blacklist file: {}", e);
-        }
+    for line in reader.lines() {
+        let line = line?;
+        let decoded = general_purpose::STANDARD
+            .decode(line.trim())
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        let domain = String::from_utf8(decoded)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        domains.push(domain);
     }
 
-    let content = read_to_string(BLACKLIST_FILE)
-        .unwrap_or_else(|_| "".to_string());
-
-    content
-        .lines()
-        .filter_map(|line| {
-            if line.trim().is_empty() {
-                None
-            } else {
-                decode(line.trim())
-                    .ok()
-                    .and_then(|bytes| String::from_utf8(bytes).ok())
-                    .map(|decoded| decoded.to_lowercase())
-            }
-        })
-        .collect()
+    Ok(domains)
 }
 
-/// Encode and add a new domain to the blacklist
-pub fn add_to_blacklist(domain: &str) -> io::Result<()> {
-    let encoded = encode(domain.to_lowercase());
-
-    let mut file = OpenOptions::new()
-        .append(true)
-        .create(true)
-        .open(BLACKLIST_FILE)?;
-
+pub fn append_to_blacklist<P: AsRef<Path>>(path: P, domain: &str) -> io::Result<()> {
+    let encoded = general_purpose::STANDARD.encode(domain.to_lowercase());
+    let mut file = OpenOptions::new().create(true).append(true).open(path)?;
     writeln!(file, "{}", encoded)?;
     Ok(())
 }
